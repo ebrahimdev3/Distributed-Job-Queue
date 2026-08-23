@@ -2,32 +2,23 @@ import { Job } from "./job.js";
 
 export class JobQueue {
     constructor() {
-        this.jobs = [];
+        this.jobs = new Map(); // استخدام Map لسرعة البحث O(1)
     }
 
     addJob(jobData) {
         const job = new Job(jobData);
-
-        this.jobs.push(job);
-
+        this.jobs.set(job.id, job);
         return job;
     }
 
     getNextJob() {
-        const queuedJobs = this.jobs.filter(
-            job => job.status === "queued"
-        );
+        const queuedJobs = Array.from(this.jobs.values())
+            .filter(job => job.status === "queued")
+            .sort((a, b) => b.priority - a.priority);
 
-        if (queuedJobs.length === 0) {
-            return null;
-        }
-
-        queuedJobs.sort(
-            (a, b) => b.priority - a.priority
-        );
+        if (queuedJobs.length === 0) return null;
 
         const job = queuedJobs[0];
-
         job.status = "processing";
         job.startedAt = new Date();
         job.attempts++;
@@ -37,10 +28,7 @@ export class JobQueue {
 
     completeJob(jobId, result = null) {
         const job = this.getJob(jobId);
-
-        if (!job) {
-            return null;
-        }
+        if (!job) return null;
 
         job.status = "completed";
         job.result = result;
@@ -51,43 +39,32 @@ export class JobQueue {
 
     failJob(jobId, error) {
         const job = this.getJob(jobId);
+        if (!job) return null;
 
-        if (!job) {
-            return null;
+        job.error = error;
+
+        if (job.attempts < job.maxAttempts) {
+            job.status = "queued";
+            job.startedAt = null;
+            return job;
         }
 
         job.status = "failed";
-        job.error = error;
         job.failedAt = new Date();
-
         return job;
     }
 
     getJob(jobId) {
-        return this.jobs.find(
-            job => job.id === jobId
-        );
+        return this.jobs.get(jobId) || null;
     }
 
     getStats() {
-        return {
-            total: this.jobs.length,
-
-            queued: this.jobs.filter(
-                job => job.status === "queued"
-            ).length,
-
-            processing: this.jobs.filter(
-                job => job.status === "processing"
-            ).length,
-
-            completed: this.jobs.filter(
-                job => job.status === "completed"
-            ).length,
-
-            failed: this.jobs.filter(
-                job => job.status === "failed"
-            ).length
-        };
+        const stats = { total: this.jobs.size, queued: 0, processing: 0, completed: 0, failed: 0 };
+        for (const job of this.jobs.values()) {
+            if (stats[job.status] !== undefined) {
+                stats[job.status]++;
+            }
+        }
+        return stats;
     }
 }

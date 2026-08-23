@@ -1,20 +1,17 @@
 import crypto from "node:crypto";
 
 export class Job {
-    constructor({
-        type,
-        payload = {},
-        priority = 0
-    }) {
-        this.id = crypto.randomUUID();
+    constructor({ type, payload = {}, priority = 0, maxAttempts = 3 }) {
+        if (!type) throw new Error("Job type is required");
 
-        this.type = type;
+        this.id = crypto.randomUUID();
+        this.type = String(type);
         this.payload = payload;
-        this.priority = priority;
+        this.priority = Number(priority) || 0;
 
         this.status = "queued";
-
         this.attempts = 0;
+        this.maxAttempts = Number(maxAttempts) || 3;
 
         this.createdAt = new Date();
         this.startedAt = null;
