@@ -1,5 +1,8 @@
 {
   "name": "distributed-job-queue",
   "version": "1.0.0",
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "redis": "^6.2.1"
+  }
 }

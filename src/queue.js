@@ -1,70 +1,175 @@
+import { createClient } from "redis";
 import { Job } from "./job.js";
 
 export class JobQueue {
+
     constructor() {
-        this.jobs = new Map(); // استخدام Map لسرعة البحث O(1)
+        this.client = createClient();
+        this.ready = this.connect();
     }
 
-    addJob(jobData) {
+    async connect() {
+        await this.client.connect();
+    }
+
+    async addJob(jobData) {
+        await this.ready;
+
         const job = new Job(jobData);
-        this.jobs.set(job.id, job);
+
+        await this.client.hSet(
+            "jobs",
+            job.id,
+            JSON.stringify(job)
+        );
+
         return job;
     }
 
-    getNextJob() {
-        const queuedJobs = Array.from(this.jobs.values())
-            .filter(job => job.status === "queued")
-            .sort((a, b) => b.priority - a.priority);
+    async getNextJob() {
+        await this.ready;
 
-        if (queuedJobs.length === 0) return null;
+        const jobs =
+            await this.client.hGetAll("jobs");
+
+        const queuedJobs =
+            Object.values(jobs)
+                .map(job => JSON.parse(job))
+                .filter(
+                    job => job.status === "queued"
+                )
+                .sort(
+                    (a, b) =>
+                        b.priority - a.priority
+                );
+
+        if (queuedJobs.length === 0) {
+            return null;
+        }
 
         const job = queuedJobs[0];
+
         job.status = "processing";
         job.startedAt = new Date();
         job.attempts++;
 
+        await this.client.hSet(
+            "jobs",
+            job.id,
+            JSON.stringify(job)
+        );
+
         return job;
     }
 
-    completeJob(jobId, result = null) {
-        const job = this.getJob(jobId);
-        if (!job) return null;
+    async completeJob(jobId, result = null) {
+        await this.ready;
+
+        const job =
+            await this.getJob(jobId);
+
+        if (!job) {
+            return null;
+        }
 
         job.status = "completed";
         job.result = result;
         job.completedAt = new Date();
 
+        await this.client.hSet(
+            "jobs",
+            job.id,
+            JSON.stringify(job)
+        );
+
         return job;
     }
 
-    failJob(jobId, error) {
-        const job = this.getJob(jobId);
-        if (!job) return null;
+    async failJob(jobId, error) {
+        await this.ready;
+
+        const job =
+            await this.getJob(jobId);
+
+        if (!job) {
+            return null;
+        }
 
         job.error = error;
 
         if (job.attempts < job.maxAttempts) {
+
             job.status = "queued";
             job.startedAt = null;
-            return job;
+
+        } else {
+
+            job.status = "failed";
+            job.failedAt = new Date();
         }
 
-        job.status = "failed";
-        job.failedAt = new Date();
+        await this.client.hSet(
+            "jobs",
+            job.id,
+            JSON.stringify(job)
+        );
+
         return job;
     }
 
-    getJob(jobId) {
-        return this.jobs.get(jobId) || null;
+    async getJob(jobId) {
+        await this.ready;
+
+        const data =
+            await this.client.hGet(
+                "jobs",
+                jobId
+            );
+
+        if (!data) {
+            return null;
+        }
+
+        return JSON.parse(data);
     }
 
-    getStats() {
-        const stats = { total: this.jobs.size, queued: 0, processing: 0, completed: 0, failed: 0 };
-        for (const job of this.jobs.values()) {
-            if (stats[job.status] !== undefined) {
+    async getAllJobs() {
+        await this.ready;
+
+        const jobs =
+            await this.client.hGetAll("jobs");
+
+        return Object.values(jobs)
+            .map(job => JSON.parse(job));
+    }
+
+    async getStats() {
+        await this.ready;
+
+        const jobs =
+            await this.client.hGetAll("jobs");
+
+        const stats = {
+            total: 0,
+            queued: 0,
+            processing: 0,
+            completed: 0,
+            failed: 0
+        };
+
+        for (const data of Object.values(jobs)) {
+
+            const job = JSON.parse(data);
+
+            stats.total++;
+
+            if (
+                stats[job.status] !== undefined
+            ) {
                 stats[job.status]++;
             }
         }
+
         return stats;
     }
 }

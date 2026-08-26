@@ -1,3 +1,5 @@
+import { JobQueue } from "./queue.js";
+
 export class Worker {
 
     constructor(queue) {
@@ -29,7 +31,8 @@ export class Worker {
 
         while (this.running) {
 
-            const job = this.queue.getNextJob();
+            const job =
+                await this.queue.getNextJob();
 
             if (!job) {
                 await this.sleep(1000);
@@ -51,7 +54,7 @@ export class Worker {
             const result =
                 await this.runJob(job);
 
-            this.queue.completeJob(
+            await this.queue.completeJob(
                 job.id,
                 result
             );
@@ -62,7 +65,7 @@ export class Worker {
 
         } catch (error) {
 
-            this.queue.failJob(
+            await this.queue.failJob(
                 job.id,
                 error.message
             );
@@ -80,6 +83,10 @@ export class Worker {
         );
 
         await this.sleep(2000);
+
+        if (job.type === "failing-task") {
+            throw new Error("Job execution failed");
+        }
 
         return {
             success: true,

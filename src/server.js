@@ -2,11 +2,7 @@ import http from "http";
 
 import { JobQueue } from "./queue.js";
 
-import { Worker } from "./worker.js";
-
 const queue = new JobQueue();
-
-const worker = new Worker(queue);
 
 const server = http.createServer(
     async (request, response) => {
@@ -33,10 +29,13 @@ const server = http.createServer(
             request.url === "/jobs"
         ) {
 
+            const jobs =
+                await queue.getAllJobs();
+
             sendJSON(
                 response,
                 200,
-                queue.jobs
+                jobs
             );
 
             return;
@@ -47,10 +46,13 @@ const server = http.createServer(
             request.url === "/stats"
         ) {
 
+            const stats =
+                await queue.getStats();
+
             sendJSON(
                 response,
                 200,
-                queue.getStats()
+                stats
             );
 
             return;
@@ -70,7 +72,7 @@ const server = http.createServer(
                     JSON.parse(body);
 
                 const job =
-                    queue.addJob(jobData);
+                    await queue.addJob(jobData);
 
                 sendJSON(
                     response,
@@ -100,7 +102,7 @@ const server = http.createServer(
         ) {
 
             const job =
-                queue.getNextJob();
+                await queue.getNextJob();
 
             if (!job) {
 
@@ -140,7 +142,7 @@ const server = http.createServer(
                     JSON.parse(body);
 
                 const job =
-                    queue.completeJob(
+                    await queue.completeJob(
                         jobId,
                         data.result ?? null
                     );
@@ -249,10 +251,9 @@ const PORT = 3000;
 server.listen(
     PORT,
     () => {
+
         console.log(
             `Server running on port ${PORT}`
         );
-
-        worker.start();
     }
 );
