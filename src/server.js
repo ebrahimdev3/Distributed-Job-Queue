@@ -2,200 +2,132 @@ import http from "http";
 
 import { JobQueue } from "./queue.js";
 
-const queue = new JobQueue();
+const queue =
+    new JobQueue();
 
-const server = http.createServer(
-    async (request, response) => {
+const server =
+    http.createServer(
+        async (
+            request,
+            response
+        ) => {
 
-        if (
-            request.method === "GET" &&
-            request.url === "/"
-        ) {
-
-            sendJSON(
-                response,
-                200,
-                {
-                    message: "Distributed Job Queue",
-                    status: "running"
-                }
-            );
-
-            return;
-        }
-
-        if (
-            request.method === "GET" &&
-            request.url === "/jobs"
-        ) {
-
-            const jobs =
-                await queue.getAllJobs();
-
-            sendJSON(
-                response,
-                200,
-                jobs
-            );
-
-            return;
-        }
-
-        if (
-            request.method === "GET" &&
-            request.url === "/stats"
-        ) {
-
-            const stats =
-                await queue.getStats();
-
-            sendJSON(
-                response,
-                200,
-                stats
-            );
-
-            return;
-        }
-
-        if (
-            request.method === "POST" &&
-            request.url === "/jobs"
-        ) {
-
-            try {
-
-                const body =
-                    await readRequestBody(request);
-
-                const jobData =
-                    JSON.parse(body);
-
-                const job =
-                    await queue.addJob(jobData);
+            if (
+                request.method === "GET" &&
+                request.url === "/"
+            ) {
 
                 sendJSON(
                     response,
-                    201,
-                    job
-                );
-
-                return;
-
-            } catch (error) {
-
-                sendJSON(
-                    response,
-                    400,
+                    200,
                     {
-                        error: "Invalid job data"
+                        message:
+                            "Distributed Job Queue",
+                        status:
+                            "running"
                     }
                 );
 
                 return;
             }
-        }
 
-        if (
-            request.method === "GET" &&
-            request.url === "/jobs/next"
-        ) {
+            if (
+                request.method === "GET" &&
+                request.url === "/jobs"
+            ) {
 
-            const job =
-                await queue.getNextJob();
-
-            if (!job) {
+                const jobs =
+                    await queue.getAllJobs();
 
                 sendJSON(
                     response,
-                    204,
-                    null
+                    200,
+                    jobs
                 );
 
                 return;
             }
 
-            sendJSON(
-                response,
-                200,
-                job
-            );
+            if (
+                request.method === "GET" &&
+                request.url === "/stats"
+            ) {
 
-            return;
-        }
+                const stats =
+                    await queue.getStats();
 
-        if (
-            request.method === "POST" &&
-            request.url.startsWith("/jobs/") &&
-            request.url.endsWith("/complete")
-        ) {
+                sendJSON(
+                    response,
+                    200,
+                    stats
+                );
 
-            const jobId =
-                request.url.split("/")[2];
+                return;
+            }
 
-            try {
+            if (
+                request.method === "POST" &&
+                request.url === "/jobs"
+            ) {
 
-                const body =
-                    await readRequestBody(request);
+                try {
 
-                const data =
-                    JSON.parse(body);
+                    const body =
+                        await readRequestBody(
+                            request
+                        );
 
-                const job =
-                    await queue.completeJob(
-                        jobId,
-                        data.result ?? null
-                    );
+                    const jobData =
+                        JSON.parse(body);
 
-                if (!job) {
+                    const job =
+                        await queue.addJob(
+                            jobData
+                        );
 
                     sendJSON(
                         response,
-                        404,
+                        201,
+                        job
+                    );
+
+                    return;
+
+                } catch (error) {
+
+                    sendJSON(
+                        response,
+                        400,
                         {
-                            error: "Job not found"
+                            error:
+                                "Invalid job data"
                         }
                     );
 
                     return;
                 }
-
-                sendJSON(
-                    response,
-                    200,
-                    job
-                );
-
-                return;
-
-            } catch (error) {
-
-                sendJSON(
-                    response,
-                    400,
-                    {
-                        error: "Invalid request"
-                    }
-                );
-
-                return;
             }
+
+            sendJSON(
+                response,
+                404,
+                {
+                    error:
+                        "Route not found"
+                }
+            );
         }
+    );
 
-        sendJSON(
-            response,
-            404,
-            {
-                error: "Route not found"
-            }
-        );
-    }
-);
-
-function readRequestBody(request) {
+function readRequestBody(
+    request
+) {
 
     return new Promise(
-        (resolve, reject) => {
+        (
+            resolve,
+            reject
+        ) => {
 
             let body = "";
 
@@ -232,14 +164,10 @@ function sendJSON(
     response.writeHead(
         statusCode,
         {
-            "Content-Type": "application/json"
+            "Content-Type":
+                "application/json"
         }
     );
-
-    if (data === null) {
-        response.end();
-        return;
-    }
 
     response.end(
         JSON.stringify(data)
