@@ -4,23 +4,32 @@ import { Job } from "./job.js";
 export class JobQueue {
 
     constructor() {
-
-        this.client = createClient();
-
+        this.client = createClient({
+            socket: {
+                reconnectStrategy: (retries) => {
+                    return Math.min(retries * 500, 5000);
+                }
+            }
+        });
         this.ready = this.connect();
     }
 
     async connect() {
-
         await this.client.connect();
     }
 
-    async addJob(jobData) {
-
+    async close() {
         await this.ready;
 
-        const job =
-            new Job(jobData);
+        if (this.client.isOpen) {
+            await this.client.quit();
+        }
+    }
+
+    async addJob(jobData) {
+        await this.ready;
+
+        const job = new Job(jobData);
 
         await this.client.hSet(
             "jobs",
@@ -28,42 +37,84 @@ export class JobQueue {
             JSON.stringify(job)
         );
 
-        await this.client.zAdd(
-            "queued_jobs",
-            {
-                score: job.priority,
-                value: job.id
-            }
-        );
+        if (job.status === "delayed") {
+            const executeTime = new Date(job.processAt).getTime();
+            await this.client.zAdd(
+                "delayed_jobs",
+                {
+                    score: executeTime,
+                    value: job.id
+                }
+            );
+        } else {
+            await this.client.zAdd(
+                "queued_jobs",
+                {
+                    score: job.priority,
+                    value: job.id
+                }
+            );
+        }
 
         return job;
     }
 
-    async getNextJob() {
-
+    async promoteDelayedJobs() {
         await this.ready;
 
-        const result =
-            await this.client.zPopMax(
-                "queued_jobs"
-            );
+        const luaScript = `
+            local now = ARGV[1]
+            local jobs = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now)
+            for _, id in ipairs(jobs) do
+                local job_data = redis.call('HGET', KEYS[2], id)
+                if job_data then
+                    redis.call('ZREM', KEYS[1], id)
+                    redis.call('ZADD', KEYS[3], 0, id)
+                end
+            end
+            return #jobs
+        `;
+
+        return await this.client.eval(luaScript, {
+            keys: ["delayed_jobs", "jobs", "queued_jobs"],
+            arguments: [Date.now().toString()]
+        });
+    }
+
+    async getNextJob() {
+        await this.ready;
+
+        await this.promoteDelayedJobs();
+
+        const luaScript = `
+            local job_id = redis.call('ZPOPMAX', KEYS[1])
+            if not job_id or #job_id == 0 then
+                return nil
+            end
+            
+            local id = job_id[1]
+            local job_data = redis.call('HGET', KEYS[2], id)
+            if not job_data then
+                return nil
+            end
+
+            local now = ARGV[1]
+            redis.call('ZADD', KEYS[3], now, id)
+            
+            return {id, job_data}
+        `;
+
+        const result = await this.client.eval(luaScript, {
+            keys: ["queued_jobs", "jobs", "processing_jobs"],
+            arguments: [Date.now().toString()]
+        });
 
         if (!result) {
             return null;
         }
 
-        const job =
-            await this.getJob(
-                result.value
-            );
-
-        if (!job) {
-            return null;
-        }
-
-        if (job.status !== "queued") {
-            return null;
-        }
+        const [jobId, jobData] = result;
+        const job = JSON.parse(jobData);
 
         job.status = "processing";
         job.startedAt = new Date();
@@ -78,11 +129,34 @@ export class JobQueue {
         return job;
     }
 
+    async heartbeat(jobId) {
+        await this.ready;
+
+        const job =
+            await this.getJob(jobId);
+
+        if (
+            !job ||
+            job.status !== "processing"
+        ) {
+            return false;
+        }
+
+        await this.client.zAdd(
+            "processing_jobs",
+            {
+                score: Date.now(),
+                value: job.id
+            }
+        );
+
+        return true;
+    }
+
     async completeJob(
         jobId,
         result = null
     ) {
-
         await this.ready;
 
         const job =
@@ -102,6 +176,11 @@ export class JobQueue {
             JSON.stringify(job)
         );
 
+        await this.client.zRem(
+            "processing_jobs",
+            job.id
+        );
+
         return job;
     }
 
@@ -109,7 +188,6 @@ export class JobQueue {
         jobId,
         error
     ) {
-
         await this.ready;
 
         const job =
@@ -121,13 +199,20 @@ export class JobQueue {
 
         job.error = error;
 
+        await this.client.zRem(
+            "processing_jobs",
+            job.id
+        );
+
         if (
             job.attempts <
             job.maxAttempts
         ) {
-
-            job.status = "queued";
+            job.status = "delayed";
             job.startedAt = null;
+
+            const delayMs = Math.pow(2, job.attempts) * 1000;
+            job.processAt = new Date(Date.now() + delayMs);
 
             await this.client.hSet(
                 "jobs",
@@ -136,9 +221,9 @@ export class JobQueue {
             );
 
             await this.client.zAdd(
-                "queued_jobs",
+                "delayed_jobs",
                 {
-                    score: job.priority,
+                    score: Date.now() + delayMs,
                     value: job.id
                 }
             );
@@ -155,11 +240,18 @@ export class JobQueue {
             JSON.stringify(job)
         );
 
+        await this.client.zAdd(
+            "failed_jobs",
+            {
+                score: Date.now(),
+                value: job.id
+            }
+        );
+
         return job;
     }
 
     async getJob(jobId) {
-
         await this.ready;
 
         const data =
@@ -176,242 +268,77 @@ export class JobQueue {
     }
 
     async getAllJobs() {
-
         await this.ready;
 
         const jobs =
-            await this.client.hGetAll(
-                "jobs"
-            );
+            await this.client.hGetAll("jobs");
 
         return Object.values(jobs)
-            .map(
-                job => JSON.parse(job)
-            );
+            .map(data => JSON.parse(data));
     }
 
-    async recoverJob(
-        jobId,
-        timeout
-    ) {
-
+    async getStalledJobs(timeout = 10000) {
         await this.ready;
 
-        const now =
-            Date.now();
+        const threshold =
+            Date.now() - timeout;
 
-        const result =
-            await this.client.eval(
-                `
-                local data =
-                    redis.call(
-                        "HGET",
-                        KEYS[1],
-                        ARGV[1]
-                    )
-
-                if not data then
-                    return 0
-                end
-
-                local job =
-                    cjson.decode(data)
-
-                if job.status ~= "processing" then
-                    return 0
-                end
-
-                if not job.startedAt then
-                    return 0
-                end
-
-                local startedAt =
-                    string.sub(
-                        job.startedAt,
-                        1,
-                        19
-                    )
-
-                local year =
-                    tonumber(
-                        string.sub(
-                            startedAt,
-                            1,
-                            4
-                        )
-                    )
-
-                local month =
-                    tonumber(
-                        string.sub(
-                            startedAt,
-                            6,
-                            7
-                        )
-                    )
-
-                local day =
-                    tonumber(
-                        string.sub(
-                            startedAt,
-                            9,
-                            10
-                        )
-                    )
-
-                local hour =
-                    tonumber(
-                        string.sub(
-                            startedAt,
-                            12,
-                            13
-                        )
-                    )
-
-                local minute =
-                    tonumber(
-                        string.sub(
-                            startedAt,
-                            15,
-                            16
-                        )
-                    )
-
-                local second =
-                    tonumber(
-                        string.sub(
-                            startedAt,
-                            18,
-                            19
-                        )
-                    )
-
-                local started =
-                    os.time({
-                        year = year,
-                        month = month,
-                        day = day,
-                        hour = hour,
-                        min = minute,
-                        sec = second
-                    })
-
-                if
-                    (
-                        ARGV[2] -
-                        (
-                            started * 1000
-                        )
-                    )
-                    <
-                    tonumber(ARGV[3])
-                then
-
-                    return 0
-                end
-
-                job.status = "queued";
-                job.startedAt = cjson.null;
-
-                redis.call(
-                    "HSET",
-                    KEYS[1],
-                    ARGV[1],
-                    cjson.encode(job)
-                );
-
-                redis.call(
-                    "ZADD",
-                    KEYS[2],
-                    job.priority,
-                    ARGV[1]
-                );
-
-                return 1
-                `,
-                {
-                    keys: [
-                        "jobs",
-                        "queued_jobs"
-                    ],
-                    arguments: [
-                        jobId,
-                        String(now),
-                        String(timeout)
-                    ]
-                }
-            );
-
-        return result === 1;
-    }
-
-    async getStalledJobs(
-        timeout = 10000
-    ) {
-
-        await this.ready;
-
-        const jobs =
-            await this.client.hGetAll(
-                "jobs"
+        const stalledIds =
+            await this.client.zRangeByScore(
+                "processing_jobs",
+                0,
+                threshold
             );
 
         const stalledJobs = [];
 
-        for (
-            const data of Object.values(jobs)
-        ) {
+        for (const jobId of stalledIds) {
 
             const job =
-                JSON.parse(data);
+                await this.getJob(jobId);
 
-            if (
-                job.status !==
-                "processing"
-            ) {
+            if (!job) {
                 continue;
             }
 
-            if (!job.startedAt) {
-                continue;
-            }
+            job.status = "queued";
+            job.startedAt = null;
 
-            const recovered =
-                await this.recoverJob(
-                    job.id,
-                    timeout
-                );
+            await this.client.hSet(
+                "jobs",
+                job.id,
+                JSON.stringify(job)
+            );
 
-            if (recovered) {
+            await this.client.zRem(
+                "processing_jobs",
+                job.id
+            );
 
-                const recoveredJob =
-                    await this.getJob(
-                        job.id
-                    );
-
-                if (recoveredJob) {
-                    stalledJobs.push(
-                        recoveredJob
-                    );
+            await this.client.zAdd(
+                "queued_jobs",
+                {
+                    score: job.priority,
+                    value: job.id
                 }
-            }
+            );
+
+            stalledJobs.push(job);
         }
 
         return stalledJobs;
     }
 
     async getStats() {
-
         await this.ready;
 
         const jobs =
-            await this.client.hGetAll(
-                "jobs"
-            );
+            await this.client.hGetAll("jobs");
 
         const stats = {
             total: 0,
             queued: 0,
+            delayed: 0,
             processing: 0,
             completed: 0,
             failed: 0
@@ -420,9 +347,7 @@ export class JobQueue {
         for (
             const data of Object.values(jobs)
         ) {
-
-            const job =
-                JSON.parse(data);
+            const job = JSON.parse(data);
 
             stats.total++;
 
@@ -430,7 +355,6 @@ export class JobQueue {
                 stats[job.status] !==
                 undefined
             ) {
-
                 stats[job.status]++;
             }
         }
