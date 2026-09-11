@@ -2,26 +2,28 @@ import http from "http";
 import { JobQueue } from "./queue.js";
 import { Logger } from "./logger.js";
 
+const API_KEY = process.env.API_KEY;
+if (!API_KEY) {
+    Logger.error("CRITICAL: API_KEY environment variable is missing.");
+    process.exit(1);
+}
+
 const queue = new JobQueue();
 
-const API_KEY = process.env.API_KEY || "secret-api-key";
-const RATE_LIMIT_WINDOW_MS = 60000;
+const RATE_LIMIT_WINDOW_SEC = 60;
 const MAX_REQUESTS_PER_WINDOW = 100;
-const requestCounts = new Map();
 
-function applyRateLimit(ip) {
-    const now = Date.now();
-    const windowData = requestCounts.get(ip) || { count: 0, startTime: now };
-
-    if (now - windowData.startTime > RATE_LIMIT_WINDOW_MS) {
-        windowData.count = 1;
-        windowData.startTime = now;
-    } else {
-        windowData.count++;
+async function applyRateLimit(ip) {
+    try {
+        const key = `rate_limit:${ip}`;
+        const requests = await queue.client.incr(key);
+        if (requests === 1) {
+            await queue.client.expire(key, RATE_LIMIT_WINDOW_SEC);
+        }
+        return requests <= MAX_REQUESTS_PER_WINDOW;
+    } catch {
+        return true; // Fallback in case of Redis glitch
     }
-
-    requestCounts.set(ip, windowData);
-    return windowData.count <= MAX_REQUESTS_PER_WINDOW;
 }
 
 function authenticate(request) {
@@ -32,26 +34,19 @@ function authenticate(request) {
 }
 
 function validateJobData(data) {
-    if (!data || typeof data !== "object") {
-        return "Payload must be an object";
-    }
-
+    if (!data || typeof data !== "object") return "Payload must be an object";
     if (!data.type || typeof data.type !== "string" || data.type.trim() === "") {
         return "Field 'type' is required and must be a non-empty string";
     }
-
     if (data.priority !== undefined && typeof data.priority !== "number") {
         return "Field 'priority' must be a number";
     }
-
     if (data.delay !== undefined && (typeof data.delay !== "number" || data.delay < 0)) {
         return "Field 'delay' must be a positive number in milliseconds";
     }
-
     if (data.payload !== undefined && (typeof data.payload !== "object" || data.payload === null)) {
         return "Field 'payload' must be an object";
     }
-
     return null;
 }
 
@@ -60,10 +55,9 @@ const dashboardHTML = `
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Job Queue Dashboard</title>
     <style>
-        body { font-family: monospace, sans-serif; background: #121212; color: #e0e0e0; margin: 20px; }
+        body { font-family: monospace; background: #121212; color: #e0e0e0; margin: 20px; }
         h1 { color: #00ffcc; }
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 20px; }
         .stat-card { background: #1e1e1e; padding: 15px; border-radius: 5px; text-align: center; border: 1px solid #333; }
@@ -77,10 +71,17 @@ const dashboardHTML = `
         .status-processing { color: #0099ff; }
         .status-completed { color: #00ff66; }
         .status-failed { color: #ff3333; }
+        #auth-section { margin-bottom: 20px; }
+        input { background: #252525; border: 1px solid #444; color: #fff; padding: 8px; }
+        button { background: #00ffcc; color: #121212; border: none; padding: 8px 12px; cursor: pointer; font-weight: bold; }
     </style>
 </head>
 <body>
     <h1>Job Queue Dashboard</h1>
+    <div id="auth-section">
+        <input type="password" id="api-key" placeholder="Enter API Key">
+        <button onclick="saveKey()">Connect</button>
+    </div>
     <div class="stats-grid" id="stats"></div>
     <h2>Jobs List</h2>
     <table>
@@ -98,9 +99,21 @@ const dashboardHTML = `
     </table>
 
     <script>
+        function saveKey() {
+            localStorage.setItem('apiKey', document.getElementById('api-key').value);
+            loadData();
+        }
+
         async function loadData() {
+            const apiKey = localStorage.getItem('apiKey');
+            if(!apiKey) return;
+            document.getElementById('api-key').value = apiKey;
+
+            const headers = { 'Authorization': 'Bearer ' + apiKey };
             try {
-                const statsRes = await fetch('/stats');
+                const statsRes = await fetch('/stats', { headers });
+                if(statsRes.status === 401) return alert('Unauthorized: Invalid API Key');
+                
                 const stats = await statsRes.json();
                 const statsContainer = document.getElementById('stats');
                 statsContainer.innerHTML = '';
@@ -113,7 +126,7 @@ const dashboardHTML = `
                     \`;
                 }
 
-                const jobsRes = await fetch('/jobs');
+                const jobsRes = await fetch('/jobs', { headers });
                 const jobs = await jobsRes.json();
                 const tableBody = document.getElementById('jobs-table');
                 tableBody.innerHTML = '';
@@ -130,244 +143,103 @@ const dashboardHTML = `
                     \`;
                 });
             } catch (err) {
-                console.error("Error fetching dashboard data:", err);
+                console.error("Dashboard error:", err);
             }
         }
 
-        loadData();
+        if(localStorage.getItem('apiKey')) loadData();
         setInterval(loadData, 3000);
     </script>
 </body>
 </html>
 `;
 
-const server = http.createServer(
-    async (request, response) => {
-        const clientIp = request.socket.remoteAddress;
+const server = http.createServer(async (request, response) => {
+    const clientIp = request.socket.remoteAddress;
 
-        if (!applyRateLimit(clientIp)) {
-            Logger.warn("Rate limit exceeded", { ip: clientIp });
-            sendJSON(response, 429, { error: "Too many requests" });
-            return;
-        }
-
-        if (
-            request.method === "GET" &&
-            request.url === "/"
-        ) {
-
-            sendJSON(
-                response,
-                200,
-                {
-                    message: "Distributed Job Queue",
-                    status: "running"
-                }
-            );
-
-            return;
-        }
-
-        if (
-            request.method === "GET" &&
-            request.url === "/dashboard"
-        ) {
-            response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-            response.end(dashboardHTML);
-            return;
-        }
-
-        if (
-            request.method === "GET" &&
-            request.url === "/jobs"
-        ) {
-
-            const jobs =
-                await queue.getAllJobs();
-
-            sendJSON(
-                response,
-                200,
-                jobs
-            );
-
-            return;
-        }
-
-        if (
-            request.method === "GET" &&
-            request.url === "/stats"
-        ) {
-
-            const stats =
-                await queue.getStats();
-
-            sendJSON(
-                response,
-                200,
-                stats
-            );
-
-            return;
-        }
-
-        if (
-            request.method === "POST" &&
-            request.url === "/jobs"
-        ) {
-            if (!authenticate(request)) {
-                Logger.warn("Unauthorized API access attempt", { ip: clientIp });
-                sendJSON(response, 401, { error: "Unauthorized access" });
-                return;
-            }
-
-            try {
-
-                const body =
-                    await readRequestBody(request);
-
-                const jobData =
-                    JSON.parse(body);
-
-                const validationError = validateJobData(jobData);
-                if (validationError) {
-                    sendJSON(
-                        response,
-                        400,
-                        {
-                            error: validationError
-                        }
-                    );
-                    return;
-                }
-
-                const job =
-                    await queue.addJob(jobData);
-
-                Logger.info("Job created", { jobId: job.id, type: job.type });
-
-                sendJSON(
-                    response,
-                    201,
-                    job
-                );
-
-                return;
-
-            } catch (error) {
-
-                sendJSON(
-                    response,
-                    400,
-                    {
-                        error: "Invalid JSON format"
-                    }
-                );
-
-                return;
-            }
-        }
-
-        if (
-            request.method === "GET" &&
-            request.url === "/jobs/next"
-        ) {
-
-            const job =
-                await queue.getNextJob();
-
-            if (!job) {
-
-                sendJSON(
-                    response,
-                    204,
-                    null
-                );
-
-                return;
-            }
-
-            sendJSON(
-                response,
-                200,
-                job
-            );
-
-            return;
-        }
-
-        sendJSON(
-            response,
-            404,
-            {
-                error: "Route not found"
-            }
-        );
+    const allowed = await applyRateLimit(clientIp);
+    if (!allowed) {
+        Logger.warn("Rate limit exceeded", { ip: clientIp });
+        sendJSON(response, 429, { error: "Too many requests" });
+        return;
     }
-);
+
+    if (request.method === "GET" && request.url === "/") {
+        sendJSON(response, 200, { message: "Distributed Job Queue Engine", status: "running" });
+        return;
+    }
+
+    if (request.method === "GET" && request.url === "/dashboard") {
+        response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        response.end(dashboardHTML);
+        return;
+    }
+
+    // المصادقة على بقية الـ API Endpoints
+    if (!authenticate(request)) {
+        Logger.warn("Unauthorized API access attempt", { ip: clientIp });
+        sendJSON(response, 401, { error: "Unauthorized access" });
+        return;
+    }
+
+    if (request.method === "GET" && request.url === "/jobs") {
+        const jobs = await queue.getAllJobs();
+        sendJSON(response, 200, jobs);
+        return;
+    }
+
+    if (request.method === "GET" && request.url === "/stats") {
+        const stats = await queue.getStats();
+        sendJSON(response, 200, stats);
+        return;
+    }
+
+    if (request.method === "POST" && request.url === "/jobs") {
+        try {
+            const body = await readRequestBody(request);
+            const jobData = JSON.parse(body);
+
+            const validationError = validateJobData(jobData);
+            if (validationError) {
+                sendJSON(response, 400, { error: validationError });
+                return;
+            }
+
+            const job = await queue.addJob(jobData);
+            Logger.info("Job created", { jobId: job.id, type: job.type });
+            sendJSON(response, 201, job);
+            return;
+        } catch {
+            sendJSON(response, 400, { error: "Invalid JSON format" });
+            return;
+        }
+    }
+
+    sendJSON(response, 404, { error: "Route not found" });
+});
 
 function readRequestBody(request) {
-
-    return new Promise(
-        (resolve, reject) => {
-
-            let body = "";
-
-            request.on(
-                "data",
-                chunk => {
-                    body += chunk;
-                }
-            );
-
-            request.on(
-                "end",
-                () => {
-                    resolve(body);
-                }
-            );
-
-            request.on(
-                "error",
-                error => {
-                    reject(error);
-                }
-            );
-        }
-    );
+    return new Promise((resolve, reject) => {
+        let body = "";
+        request.on("data", chunk => { body += chunk; });
+        request.on("end", () => resolve(body));
+        request.on("error", error => reject(error));
+    });
 }
 
-function sendJSON(
-    response,
-    statusCode,
-    data
-) {
-
-    response.writeHead(
-        statusCode,
-        {
-            "Content-Type": "application/json"
-        }
-    );
-
+function sendJSON(response, statusCode, data) {
+    response.writeHead(statusCode, { "Content-Type": "application/json" });
     if (data === null) {
         response.end();
         return;
     }
-
-    response.end(
-        JSON.stringify(data)
-    );
+    response.end(JSON.stringify(data));
 }
 
-const PORT = 3000;
-
-const serverInstance = server.listen(
-    PORT,
-    () => {
-        Logger.info(`Server running on port ${PORT}`);
-    }
-);
+const PORT = process.env.PORT || 3000;
+const serverInstance = server.listen(PORT, () => {
+    Logger.info(`Server running on port ${PORT}`);
+});
 
 const shutdown = async () => {
     Logger.info("Stopping server and closing connections...");

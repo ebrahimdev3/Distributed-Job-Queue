@@ -2,13 +2,11 @@ import { createClient } from "redis";
 import { Job } from "./job.js";
 
 export class JobQueue {
-
-    constructor() {
+    constructor(redisUrl) {
         this.client = createClient({
+            url: redisUrl || process.env.REDIS_URL || "redis://localhost:6379",
             socket: {
-                reconnectStrategy: (retries) => {
-                    return Math.min(retries * 500, 5000);
-                }
+                reconnectStrategy: (retries) => Math.min(retries * 500, 5000)
             }
         });
         this.ready = this.connect();
@@ -20,7 +18,6 @@ export class JobQueue {
 
     async close() {
         await this.ready;
-
         if (this.client.isOpen) {
             await this.client.quit();
         }
@@ -28,34 +25,20 @@ export class JobQueue {
 
     async addJob(jobData) {
         await this.ready;
-
         const job = new Job(jobData);
 
-        await this.client.hSet(
-            "jobs",
-            job.id,
-            JSON.stringify(job)
-        );
+        await this.client.hSet("jobs", job.id, JSON.stringify(job));
 
         if (job.status === "delayed") {
             const executeTime = new Date(job.processAt).getTime();
-            await this.client.zAdd(
-                "delayed_jobs",
-                {
-                    score: executeTime,
-                    value: job.id
-                }
-            );
+            await this.client.zAdd("delayed_jobs", { score: executeTime, value: job.id });
+            await this.client.hIncrBy("stats", "delayed", 1);
         } else {
-            await this.client.zAdd(
-                "queued_jobs",
-                {
-                    score: job.priority,
-                    value: job.id
-                }
-            );
+            await this.client.zAdd("queued_jobs", { score: job.priority, value: job.id });
+            await this.client.hIncrBy("stats", "queued", 1);
         }
 
+        await this.client.hIncrBy("stats", "total", 1);
         return job;
     }
 
@@ -70,20 +53,21 @@ export class JobQueue {
                 if job_data then
                     redis.call('ZREM', KEYS[1], id)
                     redis.call('ZADD', KEYS[3], 0, id)
+                    redis.call('HINCRBY', KEYS[4], 'delayed', -1)
+                    redis.call('HINCRBY', KEYS[4], 'queued', 1)
                 end
             end
             return #jobs
         `;
 
         return await this.client.eval(luaScript, {
-            keys: ["delayed_jobs", "jobs", "queued_jobs"],
+            keys: ["delayed_jobs", "jobs", "queued_jobs", "stats"],
             arguments: [Date.now().toString()]
         });
     }
 
     async getNextJob() {
         await this.ready;
-
         await this.promoteDelayedJobs();
 
         const luaScript = `
@@ -100,228 +84,137 @@ export class JobQueue {
 
             local now = ARGV[1]
             redis.call('ZADD', KEYS[3], now, id)
+            redis.call('HINCRBY', KEYS[4], 'queued', -1)
+            redis.call('HINCRBY', KEYS[4], 'processing', 1)
             
             return {id, job_data}
         `;
 
         const result = await this.client.eval(luaScript, {
-            keys: ["queued_jobs", "jobs", "processing_jobs"],
+            keys: ["queued_jobs", "jobs", "processing_jobs", "stats"],
             arguments: [Date.now().toString()]
         });
 
-        if (!result) {
-            return null;
-        }
+        if (!result) return null;
 
         const [jobId, jobData] = result;
         const job = JSON.parse(jobData);
 
         job.status = "processing";
-        job.startedAt = new Date();
+        job.startedAt = new Date().toISOString();
         job.attempts++;
 
-        await this.client.hSet(
-            "jobs",
-            job.id,
-            JSON.stringify(job)
-        );
-
+        await this.client.hSet("jobs", job.id, JSON.stringify(job));
         return job;
     }
 
     async heartbeat(jobId) {
         await this.ready;
+        const job = await this.getJob(jobId);
 
-        const job =
-            await this.getJob(jobId);
-
-        if (
-            !job ||
-            job.status !== "processing"
-        ) {
+        if (!job || job.status !== "processing") {
             return false;
         }
 
-        await this.client.zAdd(
-            "processing_jobs",
-            {
-                score: Date.now(),
-                value: job.id
-            }
-        );
+        await this.client.zAdd("processing_jobs", {
+            score: Date.now(),
+            value: job.id
+        });
 
         return true;
     }
 
-    async completeJob(
-        jobId,
-        result = null
-    ) {
+    async completeJob(jobId, result = null) {
         await this.ready;
-
-        const job =
-            await this.getJob(jobId);
-
-        if (!job) {
-            return null;
-        }
+        const job = await this.getJob(jobId);
+        if (!job) return null;
 
         job.status = "completed";
         job.result = result;
-        job.completedAt = new Date();
+        job.completedAt = new Date().toISOString();
 
-        await this.client.hSet(
-            "jobs",
-            job.id,
-            JSON.stringify(job)
-        );
-
-        await this.client.zRem(
-            "processing_jobs",
-            job.id
-        );
+        await this.client.hSet("jobs", job.id, JSON.stringify(job));
+        await this.client.zRem("processing_jobs", job.id);
+        
+        await this.client.hIncrBy("stats", "processing", -1);
+        await this.client.hIncrBy("stats", "completed", 1);
 
         return job;
     }
 
-    async failJob(
-        jobId,
-        error
-    ) {
+    async failJob(jobId, error) {
         await this.ready;
-
-        const job =
-            await this.getJob(jobId);
-
-        if (!job) {
-            return null;
-        }
+        const job = await this.getJob(jobId);
+        if (!job) return null;
 
         job.error = error;
+        await this.client.zRem("processing_jobs", job.id);
+        await this.client.hIncrBy("stats", "processing", -1);
 
-        await this.client.zRem(
-            "processing_jobs",
-            job.id
-        );
-
-        if (
-            job.attempts <
-            job.maxAttempts
-        ) {
+        if (job.attempts < job.maxAttempts) {
             job.status = "delayed";
             job.startedAt = null;
 
             const delayMs = Math.pow(2, job.attempts) * 1000;
-            job.processAt = new Date(Date.now() + delayMs);
+            job.processAt = new Date(Date.now() + delayMs).toISOString();
 
-            await this.client.hSet(
-                "jobs",
-                job.id,
-                JSON.stringify(job)
-            );
-
-            await this.client.zAdd(
-                "delayed_jobs",
-                {
-                    score: Date.now() + delayMs,
-                    value: job.id
-                }
-            );
+            await this.client.hSet("jobs", job.id, JSON.stringify(job));
+            await this.client.zAdd("delayed_jobs", {
+                score: Date.now() + delayMs,
+                value: job.id
+            });
+            await this.client.hIncrBy("stats", "delayed", 1);
 
             return job;
         }
 
         job.status = "failed";
-        job.failedAt = new Date();
+        job.failedAt = new Date().toISOString();
 
-        await this.client.hSet(
-            "jobs",
-            job.id,
-            JSON.stringify(job)
-        );
-
-        await this.client.zAdd(
-            "failed_jobs",
-            {
-                score: Date.now(),
-                value: job.id
-            }
-        );
+        await this.client.hSet("jobs", job.id, JSON.stringify(job));
+        await this.client.zAdd("failed_jobs", {
+            score: Date.now(),
+            value: job.id
+        });
+        await this.client.hIncrBy("stats", "failed", 1);
 
         return job;
     }
 
     async getJob(jobId) {
         await this.ready;
-
-        const data =
-            await this.client.hGet(
-                "jobs",
-                jobId
-            );
-
-        if (!data) {
-            return null;
-        }
-
-        return JSON.parse(data);
+        const data = await this.client.hGet("jobs", jobId);
+        return data ? JSON.parse(data) : null;
     }
 
     async getAllJobs() {
         await this.ready;
-
-        const jobs =
-            await this.client.hGetAll("jobs");
-
-        return Object.values(jobs)
-            .map(data => JSON.parse(data));
+        const jobs = await this.client.hGetAll("jobs");
+        return Object.values(jobs).map(data => JSON.parse(data));
     }
 
     async getStalledJobs(timeout = 10000) {
         await this.ready;
-
-        const threshold =
-            Date.now() - timeout;
-
-        const stalledIds =
-            await this.client.zRangeByScore(
-                "processing_jobs",
-                0,
-                threshold
-            );
-
+        const threshold = Date.now() - timeout;
+        const stalledIds = await this.client.zRangeByScore("processing_jobs", 0, threshold);
         const stalledJobs = [];
 
         for (const jobId of stalledIds) {
-
-            const job =
-                await this.getJob(jobId);
-
-            if (!job) {
-                continue;
-            }
+            const job = await this.getJob(jobId);
+            if (!job) continue;
 
             job.status = "queued";
             job.startedAt = null;
 
-            await this.client.hSet(
-                "jobs",
-                job.id,
-                JSON.stringify(job)
-            );
+            await this.client.hSet("jobs", job.id, JSON.stringify(job));
+            await this.client.zRem("processing_jobs", job.id);
+            await this.client.zAdd("queued_jobs", {
+                score: job.priority,
+                value: job.id
+            });
 
-            await this.client.zRem(
-                "processing_jobs",
-                job.id
-            );
-
-            await this.client.zAdd(
-                "queued_jobs",
-                {
-                    score: job.priority,
-                    value: job.id
-                }
-            );
+            await this.client.hIncrBy("stats", "processing", -1);
+            await this.client.hIncrBy("stats", "queued", 1);
 
             stalledJobs.push(job);
         }
@@ -331,34 +224,14 @@ export class JobQueue {
 
     async getStats() {
         await this.ready;
-
-        const jobs =
-            await this.client.hGetAll("jobs");
-
-        const stats = {
-            total: 0,
-            queued: 0,
-            delayed: 0,
-            processing: 0,
-            completed: 0,
-            failed: 0
+        const stats = await this.client.hGetAll("stats");
+        return {
+            total: Number(stats.total || 0),
+            queued: Number(stats.queued || 0),
+            delayed: Number(stats.delayed || 0),
+            processing: Number(stats.processing || 0),
+            completed: Number(stats.completed || 0),
+            failed: Number(stats.failed || 0)
         };
-
-        for (
-            const data of Object.values(jobs)
-        ) {
-            const job = JSON.parse(data);
-
-            stats.total++;
-
-            if (
-                stats[job.status] !==
-                undefined
-            ) {
-                stats[job.status]++;
-            }
-        }
-
-        return stats;
     }
 }
