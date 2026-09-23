@@ -21,7 +21,6 @@ export class Worker {
         this.running = true;
         Logger.info(`Worker started`, { workerId: this.id });
 
-        // تشغيل فاحص المهام المتوقفة كل 30 ثانية بشكل منفصل
         this.stalledCheckTimer = setInterval(async () => {
             if (!this.running) return;
             try {
@@ -37,7 +36,7 @@ export class Worker {
     async process() {
         while (this.running) {
             try {
-                const job = await this.queue.getNextJob();
+                const job = await this.queue.getNextJob(this.id);
 
                 if (!job) {
                     await this.sleep(1000);
@@ -45,13 +44,13 @@ export class Worker {
                 }
 
                 this.currentJob = job;
-                Logger.info(`Worker claimed job`, { workerId: this.id, jobId: job.id });
+                Logger.info(`Worker claimed job`, { workerId: this.id, jobId: job.id, token: job.lockToken });
 
                 await this.execute(job);
                 this.currentJob = null;
             } catch (error) {
                 Logger.error("Worker processing error", { error: error.message });
-                await this.sleep(2000); // إتاحة وقت لإعادة الاتصال في حال انقطاع الشبكة
+                await this.sleep(2000);
             }
         }
     }
@@ -60,8 +59,11 @@ export class Worker {
         this.stopHeartbeat();
         this.heartbeatTimer = setInterval(async () => {
             try {
-                const alive = await this.queue.heartbeat(job.id);
-                if (!alive) this.stopHeartbeat();
+                const alive = await this.queue.heartbeat(job.id, job.lockToken);
+                if (!alive) {
+                    Logger.warn(`Heartbeat rejected. Worker lost lock for job.`, { jobId: job.id });
+                    this.stopHeartbeat();
+                }
             } catch (error) {
                 Logger.error(`Heartbeat error`, { jobId: job.id, error: error.message });
             }
@@ -82,12 +84,22 @@ export class Worker {
         try {
             const result = await this.handlers.execute(job);
             this.stopHeartbeat();
-            await this.queue.completeJob(job.id, result);
+            await this.queue.completeJob(job.id, job.lockToken, result);
             Logger.info(`Job completed`, { jobId: job.id });
         } catch (error) {
             this.stopHeartbeat();
-            await this.queue.failJob(job.id, error.message);
-            Logger.error(`Job failed`, { jobId: job.id, error: error.message });
+
+            if (error.message.includes("LockLostError")) {
+                Logger.error(`Execution finished but lock was lost for job ${job.id}. Skipping status override.`);
+                return;
+            }
+
+            try {
+                await this.queue.failJob(job.id, job.lockToken, error.message);
+                Logger.error(`Job failed`, { jobId: job.id, error: error.message });
+            } catch (failErr) {
+                Logger.error(`Failed to update fail status due to lost lock`, { jobId: job.id, error: failErr.message });
+            }
         }
     }
 
@@ -101,7 +113,6 @@ export class Worker {
             clearInterval(this.stalledCheckTimer);
         }
 
-        // انتظار إنهاء المهمة الجارية
         while (this.currentJob) {
             await this.sleep(100);
         }

@@ -1,4 +1,5 @@
 import http from "http";
+import crypto from "node:crypto";
 import { JobQueue } from "./queue.js";
 import { Logger } from "./logger.js";
 
@@ -21,16 +22,25 @@ async function applyRateLimit(ip) {
             await queue.client.expire(key, RATE_LIMIT_WINDOW_SEC);
         }
         return requests <= MAX_REQUESTS_PER_WINDOW;
-    } catch {
-        return true; // Fallback in case of Redis glitch
+    } catch (error) {
+        Logger.error("Rate limiter failure via Redis", { error: error.message });
+        return false;
     }
 }
 
 function authenticate(request) {
     const authHeader = request.headers["authorization"];
     if (!authHeader) return false;
+
     const token = authHeader.replace("Bearer ", "").trim();
-    return token === API_KEY;
+    const keyBuffer = Buffer.from(API_KEY);
+    const tokenBuffer = Buffer.from(token);
+
+    if (keyBuffer.length !== tokenBuffer.length) {
+        return false;
+    }
+
+    return crypto.timingSafeEqual(keyBuffer, tokenBuffer);
 }
 
 function validateJobData(data) {
@@ -63,7 +73,7 @@ const dashboardHTML = `
         .stat-card { background: #1e1e1e; padding: 15px; border-radius: 5px; text-align: center; border: 1px solid #333; }
         .stat-card h3 { margin: 0; font-size: 14px; color: #888; }
         .stat-card p { margin: 5px 0 0 0; font-size: 22px; font-weight: bold; color: #00ffcc; }
-        table { width: 100%; border-collapse: collapse; background: #1e1e1e; }
+        table { width: 100%; border-collapse: collapse; background: #1e1e1e; margin-bottom: 30px; }
         th, td { border: 1px solid #333; padding: 10px; text-align: left; }
         th { background: #252525; color: #888; }
         .status-queued { color: #ffbb00; }
@@ -83,6 +93,7 @@ const dashboardHTML = `
         <button onclick="saveKey()">Connect</button>
     </div>
     <div class="stats-grid" id="stats"></div>
+    
     <h2>Jobs List</h2>
     <table>
         <thead>
@@ -96,6 +107,20 @@ const dashboardHTML = `
             </tr>
         </thead>
         <tbody id="jobs-table"></tbody>
+    </table>
+
+    <h2>Dead Letter Queue (DLQ)</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Type</th>
+                <th>Error</th>
+                <th>Attempts</th>
+                <th>Failed At</th>
+            </tr>
+        </thead>
+        <tbody id="dlq-table"></tbody>
     </table>
 
     <script>
@@ -142,6 +167,23 @@ const dashboardHTML = `
                         </tr>
                     \`;
                 });
+
+                const dlqRes = await fetch('/dlq', { headers });
+                const dlqJobs = await dlqRes.json();
+                const dlqBody = document.getElementById('dlq-table');
+                dlqBody.innerHTML = '';
+                dlqJobs.forEach(job => {
+                    dlqBody.innerHTML += \`
+                        <tr>
+                            <td>\${job.id}</td>
+                            <td>\${job.type}</td>
+                            <td class="status-failed">\${job.error || 'N/A'}</td>
+                            <td>\${job.attempts}/\${job.maxAttempts}</td>
+                            <td>\${new Date(job.failedAt).toLocaleString()}</td>
+                        </tr>
+                    \`;
+                });
+
             } catch (err) {
                 console.error("Dashboard error:", err);
             }
@@ -159,8 +201,8 @@ const server = http.createServer(async (request, response) => {
 
     const allowed = await applyRateLimit(clientIp);
     if (!allowed) {
-        Logger.warn("Rate limit exceeded", { ip: clientIp });
-        sendJSON(response, 429, { error: "Too many requests" });
+        Logger.warn("Rate limit exceeded or limiter service unavailable", { ip: clientIp });
+        sendJSON(response, 429, { error: "Too many requests or service degraded" });
         return;
     }
 
@@ -175,7 +217,6 @@ const server = http.createServer(async (request, response) => {
         return;
     }
 
-    // المصادقة على بقية الـ API Endpoints
     if (!authenticate(request)) {
         Logger.warn("Unauthorized API access attempt", { ip: clientIp });
         sendJSON(response, 401, { error: "Unauthorized access" });
@@ -185,6 +226,12 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/jobs") {
         const jobs = await queue.getAllJobs();
         sendJSON(response, 200, jobs);
+        return;
+    }
+
+    if (request.method === "GET" && request.url === "/dlq") {
+        const dlqJobs = await queue.getDLQJobs();
+        sendJSON(response, 200, dlqJobs);
         return;
     }
 

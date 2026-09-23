@@ -1,22 +1,12 @@
-export class Logger {
-    static formatLog(level, message, meta = {}) {
-        return JSON.stringify({
-            timestamp: new Date().toISOString(),
-            level,
-            message,
-            ...meta
-        });
-    }
+import winston from "winston";
 
-    static info(message, meta) {
-        console.log(this.formatLog("INFO", message, meta));
-    }
-
-    static error(message, meta) {
-        console.error(this.formatLog("ERROR", message, meta));
-    }
-
-    static warn(message, meta) {
-        console.warn(this.formatLog("WARN", message, meta));
-    }
-}
+export const Logger = winston.createLogger({
+    level: process.env.LOG_LEVEL || "info",
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.Console()
+    ]
+});
